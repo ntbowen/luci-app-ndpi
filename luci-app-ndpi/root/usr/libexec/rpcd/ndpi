@@ -1,0 +1,227 @@
+#!/bin/sh
+# rpcd/ubus backend for luci-app-ndpi
+# Provides JSON-RPC endpoints for the LuCI frontend
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+# ---------------------------------------------------------------
+# Helper: read nDPI service status
+# ---------------------------------------------------------------
+get_service_status() {
+	local pid="" running="false" mem_rss="0" mem_virt="0" uptime_secs="0"
+
+	pid=$(pidof ndpiReader 2>/dev/null)
+	pid=${pid%% *}
+	if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+		running="true"
+		mem_rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status 2>/dev/null || echo 0)
+		mem_virt=$(awk '/VmSize/{print $2}' /proc/$pid/status 2>/dev/null || echo 0)
+		local start_time
+		start_time=$(stat -c %Y /proc/$pid 2>/dev/null || echo 0)
+		local now
+		now=$(date +%s)
+		uptime_secs=$((now - start_time))
+	fi
+
+	json_init
+	json_add_boolean running "$running"
+	json_add_string pid "${pid:-N/A}"
+	json_add_int memory_rss "$mem_rss"
+	json_add_int memory_virtual "$mem_virt"
+	json_add_int uptime "$uptime_secs"
+	json_dump
+}
+
+# ---------------------------------------------------------------
+# Helper: read system memory info
+# ---------------------------------------------------------------
+get_system_memory() {
+	json_init
+	local total free available buffers cached
+	total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+	free=$(awk '/^MemFree:/{print $2}' /proc/meminfo)
+	available=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+	buffers=$(awk '/^Buffers:/{print $2}' /proc/meminfo)
+	cached=$(awk '/^Cached:/{print $2}' /proc/meminfo)
+
+	json_add_int total "${total:-0}"
+	json_add_int free "${free:-0}"
+	json_add_int available "${available:-0}"
+	json_add_int buffers "${buffers:-0}"
+	json_add_int cached "${cached:-0}"
+	json_dump
+}
+
+# ---------------------------------------------------------------
+# Helper: get flow statistics from ndpiReader JSON
+# ---------------------------------------------------------------
+get_flow_stats() {
+	local json_log
+	json_log=$(uci -q get ndpi.global.json_log)
+	json_log="${json_log:-/tmp/ndpi_flows.json}"
+
+	if [ -f "$json_log" ]; then
+		cat "$json_log" 2>/dev/null
+	else
+		echo '{"flows":[],"total":0}'
+	fi
+}
+
+# ---------------------------------------------------------------
+# Helper: get detected protocols summary
+# ---------------------------------------------------------------
+get_protocol_stats() {
+	local json_log
+	json_log=$(uci -q get ndpi.global.json_log)
+	json_log="${json_log:-/tmp/ndpi_flows.json}"
+
+	if [ -f "$json_log" ]; then
+		# Parse flows and aggregate protocol counts
+		awk '
+		BEGIN { print "[" }
+		/"detected.protocol.name"/ {
+			gsub(/[",]/, "", $2)
+			proto[$2]++
+		}
+		END {
+			first=1
+			for (p in proto) {
+				if (!first) printf ","
+				printf "{\"protocol\":\"%s\",\"count\":%d,\"bytes\":0}", p, proto[p]
+				first=0
+			}
+			print "]"
+		}' "$json_log" 2>/dev/null
+	else
+		echo "[]"
+	fi
+}
+
+# ---------------------------------------------------------------
+# Helper: get alerts
+# ---------------------------------------------------------------
+get_alerts() {
+	local alert_log count
+	alert_log=$(uci -q get ndpi.alerts.alert_log)
+	alert_log="${alert_log:-/tmp/ndpi_alerts.log}"
+	count="${1:-50}"
+
+	json_init
+	json_add_array alerts
+
+	if [ -f "$alert_log" ]; then
+		tail -n "$count" "$alert_log" | while IFS= read -r line; do
+			json_add_object ""
+			json_add_string message "$line"
+			json_close_object
+		done
+	fi
+
+	# Also pull from syslog
+	logread 2>/dev/null | grep -i "ndpi" | tail -n "$count" | while IFS= read -r line; do
+		json_add_object ""
+		json_add_string message "$line"
+		json_add_string source "syslog"
+		json_close_object
+	done
+
+	json_close_array
+	json_dump
+}
+
+# ---------------------------------------------------------------
+# Helper: get live traffic (conntrack + nDPI classification)
+# ---------------------------------------------------------------
+get_live_traffic() {
+	local interface
+	interface=$(uci -q get ndpi.global.interface)
+	interface="${interface:-br-lan}"
+
+	json_init
+	json_add_array connections
+
+	# Read from conntrack
+	if [ -f /proc/net/nf_conntrack ]; then
+		head -100 /proc/net/nf_conntrack 2>/dev/null | while IFS= read -r line; do
+			json_add_object ""
+			json_add_string raw "$line"
+			json_close_object
+		done
+	fi
+
+	json_close_array
+	json_dump
+}
+
+# ---------------------------------------------------------------
+# Helper: get interface traffic stats
+# ---------------------------------------------------------------
+get_interface_stats() {
+	local interface
+	interface=$(uci -q get ndpi.global.interface)
+	interface="${interface:-br-lan}"
+
+	json_init
+	if [ -d "/sys/class/net/$interface" ]; then
+		json_add_string interface "$interface"
+		json_add_int rx_bytes "$(cat /sys/class/net/$interface/statistics/rx_bytes 2>/dev/null || echo 0)"
+		json_add_int tx_bytes "$(cat /sys/class/net/$interface/statistics/tx_bytes 2>/dev/null || echo 0)"
+		json_add_int rx_packets "$(cat /sys/class/net/$interface/statistics/rx_packets 2>/dev/null || echo 0)"
+		json_add_int tx_packets "$(cat /sys/class/net/$interface/statistics/tx_packets 2>/dev/null || echo 0)"
+		json_add_int rx_errors "$(cat /sys/class/net/$interface/statistics/rx_errors 2>/dev/null || echo 0)"
+		json_add_int tx_errors "$(cat /sys/class/net/$interface/statistics/tx_errors 2>/dev/null || echo 0)"
+	else
+		json_add_string error "Interface $interface not found"
+	fi
+	json_dump
+}
+
+# ---------------------------------------------------------------
+# ubus method dispatch
+# ---------------------------------------------------------------
+case "$1" in
+	list)
+		echo '{"getStatus":{},"getMemory":{},"getFlows":{},"getProtocols":{},"getAlerts":{"count":50},"getTraffic":{},"getInterfaceStats":{},"startService":{},"stopService":{},"restartService":{}}'
+		;;
+	call)
+		case "$2" in
+			getStatus)
+				get_service_status
+				;;
+			getMemory)
+				get_system_memory
+				;;
+			getFlows)
+				get_flow_stats
+				;;
+			getProtocols)
+				get_protocol_stats
+				;;
+			getAlerts)
+				read -r input
+				json_load "$input"
+				json_get_var count count
+				get_alerts "${count:-50}"
+				;;
+			getTraffic)
+				get_live_traffic
+				;;
+			getInterfaceStats)
+				get_interface_stats
+				;;
+			startService)
+				/etc/init.d/ndpi start 2>&1
+				echo '{"result":"started"}'
+				;;
+			stopService)
+				/etc/init.d/ndpi stop 2>&1
+				echo '{"result":"stopped"}'
+				;;
+			restartService)
+				/etc/init.d/ndpi restart 2>&1
+				echo '{"result":"restarted"}'
+				;;
+		esac
+		;;
+esac

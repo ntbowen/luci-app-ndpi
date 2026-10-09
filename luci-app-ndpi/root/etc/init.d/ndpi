@@ -1,0 +1,92 @@
+#!/bin/sh /etc/rc.common
+# nDPI Deep Packet Inspection service init script
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/ndpiReader
+CONF=/etc/config/ndpi
+ALERT_LOG=/tmp/ndpi_alerts.log
+
+validate_section() {
+	uci_validate_section ndpi global "${1}" \
+		'enabled:bool:1' \
+		'interface:string:br-lan' \
+		'log_level:uinteger:1' \
+		'json_log:string:/tmp/ndpi_flows.json' \
+		'flow_max_packets:uinteger:10' \
+		'enable_guess:bool:1' \
+		'decode_tunnels:bool:1' \
+		'track_payload:bool:0'
+}
+
+start_service() {
+	local enabled interface log_level json_log
+	local flow_max_packets
+	local enable_guess decode_tunnels track_payload
+
+	config_load ndpi
+	validate_section global || {
+		echo "validation failed"
+		return 1
+	}
+
+	[ "$enabled" = "1" ] || {
+		echo "nDPI is disabled in configuration"
+		return 0
+	}
+
+	# Ensure log directory exists
+	mkdir -p "$(dirname "$json_log")"
+	mkdir -p "$(dirname "$ALERT_LOG")"
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+
+	# Interface to monitor
+	procd_append_param command -i "$interface"
+
+	# Write serialized flow results as JSON.  In nDPI 6, -j loads a JA4
+	# fingerprint file; JSON output is selected with -K and written with -k.
+	procd_append_param command -K json -k "$json_log"
+
+	# Verbose level
+	[ "$log_level" -gt 0 ] && procd_append_param command -v "$log_level"
+
+	# Protocol guessing is enabled by default.  Explicitly disable it when the
+	# corresponding UCI option is false (-g configures CPU affinity in nDPI 6).
+	[ "$enable_guess" = "1" ] || \
+		procd_append_param command --cfg=dpi.guess_on_giveup,0
+
+	# Dissect supported GTP/TZSP tunnels (-T requires a TCP packet count).
+	[ "$decode_tunnels" = "1" ] && procd_append_param command -t
+
+	# Payload tracking (-p expects a protocol definition file in nDPI 6).
+	[ "$track_payload" = "1" ] && \
+		procd_append_param command --cfg=flow.track_payload,1
+
+	# Bound the number of packets inspected for each flow.
+	procd_append_param command --cfg=packets_limit_per_flow,"$flow_max_packets"
+
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+
+	procd_close_instance
+
+	logger -t ndpi "nDPI DPI service started on interface $interface"
+}
+
+stop_service() {
+	logger -t ndpi "nDPI DPI service stopped"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "ndpi"
+}
